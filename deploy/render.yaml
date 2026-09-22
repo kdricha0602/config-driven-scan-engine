@@ -1,0 +1,18 @@
+# Render blueprint — Tier 1 (primary). Assumes the repo from deploy/github/.
+# Set env vars in the Render dashboard (never in this file):
+#   TIER_NAME=render  DATABASE_URL=<supabase pooled URL>  WATCHDOG_SECRET=<secret>
+services:
+  - type: web
+    name: scan-tier-render
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile
+    dockerContext: ./files
+    plan: free
+    healthCheckPath: /ready
+    envVars:
+      - key: TIER_NAME
+        value: render
+      - key: TEMPORAL_ADDRESS
+        value: localhost:7233
+      - key: PORT
+        value: 8000

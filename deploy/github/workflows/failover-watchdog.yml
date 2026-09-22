@@ -1,0 +1,92 @@
+# Failover Watchdog — probes all three free tiers in order and triggers due scans
+# on the first healthy one. External to every tier, so a sleeping or dead tier
+# is never a single point of failure.
+#
+# Required repository secrets:
+#   TIER1_URL, TIER2_URL, TIER3_URL   base URLs, e.g. https://scan-t1.onrender.com
+#   WATCHDOG_SECRET                    shared secret, also set as env on every tier
+#   SUPABASE_URL, SUPABASE_SERVICE_KEY used ONLY if every tier is unreachable,
+#                                to record the outage in audit_log
+#
+# Cost note: GitHub Actions gives unlimited minutes on PUBLIC repos. If this
+# repo is private (2,000 min/mo free), either make it public or drop the
+# schedule to every 30 minutes.
+name: Failover Watchdog
+
+on:
+  schedule:
+    # Every 10 minutes. The tier itself decides which scans are due, so the
+    # watchdog stays dumb: probe -> trigger -> log. (GitHub's minimum is 5;
+    # 10 keeps private-repo minute budgets sane.)
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Manual trigger reason"
+        required: false
+        default: "manual"
+
+concurrency:
+  group: failover-watchdog
+  cancel-in-progress: false  # never cancel a probe mid-flight; a duplicate
+                             # trigger is harmless (advisory lock dedups)
+
+jobs:
+  probe-and-trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe tiers in order, trigger due scans
+        id: probe
+        env:
+          TIER1_URL: ${{ secrets.TIER1_URL }}
+          TIER2_URL: ${{ secrets.TIER2_URL }}
+          TIER3_URL: ${{ secrets.TIER3_URL }}
+          WATCHDOG_SECRET: ${{ secrets.WATCHDOG_SECRET }}
+        run: |
+          set -u
+          WINNER=""
+          for TIER in "$TIER1_URL" "$TIER2_URL" "$TIER3_URL"; do
+            [ -z "$TIER" ] && continue
+            # /ready checks the tier AND its database connectivity.
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$TIER/ready" || echo "000")
+            echo "probe $TIER -> $CODE"
+            if [ "$CODE" = "200" ]; then
+              WINNER="$TIER"
+              break
+            fi
+          done
+
+          if [ -z "$WINNER" ]; then
+            echo "ALL_TIERS_UNREACHABLE=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "winner=$WINNER"
+          RESP=$(curl -s --max-time 120 -w "\n%{http_code}" -X POST "$WINNER/internal/run-due-scans" \
+            -H "Content-Type: application/json" \
+            -H "X-Watchdog-Secret: $WATCHDOG_SECRET" \
+            -d "{\"triggered_by\": \"github-watchdog\", \"run_id\": \"${{ github.run_id }}\"}")
+          BODY=$(echo "$RESP" | sed '$d')
+          CODE=$(echo "$RESP" | tail -n1)
+          echo "trigger -> $CODE $BODY"
+          [ "$CODE" = "200" ] || exit 1
+
+      - name: Record total outage in audit log
+        if: failure() && steps.probe.outputs.ALL_TIERS_UNREACHABLE == 'true'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          set -u
+          curl -s --max-time 20 -X POST "$SUPABASE_URL/rest/v1/audit_log" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"tier\": \"watchdog\", \"event\": \"all_tiers_unreachable\", \
+                 \"detail\": {\"run_id\": \"${{ github.run_id }}\", \
+                              \"tiers\": [\"${{ secrets.TIER1_URL }}\", \
+                                          \"${{ secrets.TIER2_URL }}\", \
+                                          \"${{ secrets.TIER3_URL }}\"]}}"
+          echo "outage recorded; all three tiers unreachable"
+          exit 1

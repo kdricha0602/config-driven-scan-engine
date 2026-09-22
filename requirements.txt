@@ -1,0 +1,11 @@
+# Core runtime
+fastapi>=0.110
+pydantic>=2.0
+uvicorn>=0.29
+pyyaml>=6.0
+
+# Orchestration
+temporalio>=1.5
+
+# LLM interpretation (catalyst analysis, thesis contradiction, synthesis)
+litellm>=1.0

@@ -1,0 +1,105 @@
+# Scan configurations — 2026-09-19 (Korben's design)
+
+# Architecture: Temporal orchestrates the scan; Activities fetch market data, SEC filings,
+# news, and compute technical/financial values; LiteLLM handles catalyst interpretation,
+# financial-language analysis, thesis contradiction, and final synthesis. The scan config
+# determines what a given scan cares about. Final synthesis produces the Top 3-5 WITHOUT
+# forcing a candidate into the list merely to fill the quota.
+
+# Engine-wide output rules. These apply to EVERY scan and are enforced by the
+# deterministic quality_control activity — the LLM synthesis cannot override
+# them, and a violating pick is dropped, never silently fixed.
+engine_rules:
+  mega_cap:
+    # A mega-cap (market cap at/above threshold) priced OVER price_cap is
+    # never emitted in any scan result.
+    threshold: 200B
+    price_cap: 35
+    # A mega-cap at/under price_cap may appear only if it satisfies at
+    # least this fraction of the scan's hard criteria.
+    min_criteria_fraction: 0.8
+
+  limits:
+    # Max concurrent per-ticker child workflows. An unbounded fan-out over a
+    # full universe is a self-DoS (history bloat, rate limits, runaway LLM
+    # cost); tickers are processed in chunks of this size.
+    max_concurrent_tickers: 25
+    # Hard ceiling on universe size. A larger universe fails closed with a
+    # clear error instead of running away — raise explicitly to allow more.
+    max_tickers: 5000
+
+scans:
+  - scan:
+      name: "Micro Cap Momentum"
+
+      universe:
+        market_cap:
+          min: 30M
+          max: 1B
+
+      hard_filters:
+        price:
+          min: 2
+          max: 20
+
+        float:
+          max: 10M
+
+        relative_volume:
+          min: 3
+
+        daily_move:
+          min: 10%
+
+        volume:
+          min: 500000
+
+        catalyst_age:
+          max_days: 7
+
+      analytics:
+        technicals: true
+        catalyst_quality: true
+        dilution: true
+        relative_strength: true
+        fundamentals: true
+        valuation: true
+        thesis_contradiction: true
+        data_confidence: true
+
+      output:
+        top_candidates: 5
+        watchlist: 5
+
+  - scan:
+      name: "Large Cap Compounders"
+
+      universe:
+        market_cap:
+          min: 10B
+
+      hard_filters:
+        roic:
+          min: 13%
+
+        revenue_cagr:
+          min: 9%
+
+        fcf:
+          positive_years: 2
+
+        net_debt_ebitda:
+          max: 1.6
+
+      analytics:
+        technicals: true
+        catalyst_quality: true
+        dilution: true
+        relative_strength: true
+        fundamentals: true
+        valuation: true
+        thesis_contradiction: true
+        data_confidence: true
+
+      output:
+        top_candidates: 5
