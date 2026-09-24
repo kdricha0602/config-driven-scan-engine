@@ -256,15 +256,33 @@ class Fundamentals:
     ticker: str
     revenue_ttm: Optional[float] = None
     revenue_cagr_2y: Optional[float] = None
+    revenue_yoy_1y: Optional[float] = None
     eps_cagr_2y: Optional[float] = None
+    eps_cagr_2y_split_adj: Optional[float] = None
+    eps_yoy_1y_split_adj: Optional[float] = None
+    # Gate EPS-growth value: forward analyst estimates when available,
+    # else TTM YoY (split-adjusted). The source is always recorded —
+    # never mix the two silently.
+    eps_growth_1y: Optional[float] = None
+    eps_growth_source: str = ""
+    eps_growth_analysts: int = 0
+    current_ratio: Optional[float] = None
+    debt_equity: Optional[float] = None
+    gross_margin_latest: Optional[float] = None
+    gross_margin_expanding: Optional[bool] = None
     eps_ttm: Optional[float] = None
     fcf_ttm: Optional[float] = None
     fcf_margin: Optional[float] = None
+    fcf_positive_years_4: Optional[int] = None
     roic: Optional[float] = None
+    roic_incremental_2y: Optional[float] = None
     net_debt_ebitda: Optional[float] = None
     ebit_interest: Optional[float] = None
     ebitda_latest: Optional[float] = None
+    ebitda_ttm: Optional[float] = None
     net_debt_latest: Optional[float] = None
+    debt_latest: Optional[float] = None
+    cash_latest: Optional[float] = None
     sbc_annual: Optional[float] = None
     buybacks_annual: Optional[float] = None
     shares_dilution_2y_pct: Optional[float] = None
@@ -272,6 +290,23 @@ class Fundamentals:
     revenue_history: List[List[float]] = field(default_factory=list)
     eps_history: List[List[float]] = field(default_factory=list)
     fcf_history: List[List[float]] = field(default_factory=list)
+
+
+@dataclass
+class Valuation:
+    """Gate 7 (forward, via Bigdata) + gate 8 (trailing multiples)."""
+    ticker: str
+    fwd_pe: Optional[float] = None
+    ntm_eps: Optional[float] = None
+    fwd_growth_pct: Optional[float] = None
+    peg: Optional[float] = None
+    peer_median_fwd_pe: Optional[float] = None
+    discount_vs_peers_pct: Optional[float] = None
+    peers_used: Optional[int] = None
+    gate7_pass: Optional[bool] = None
+    ev_ebitda_ttm: Optional[float] = None
+    fcf_yield_ttm: Optional[float] = None
+    error: str = ""
 
 
 @dataclass
@@ -294,6 +329,7 @@ class TickerBundle:
     news: List[NewsItem] = field(default_factory=list)
     catalyst_verdict: Dict[str, Any] = field(default_factory=dict)
     relative_strength: Dict[str, Any] = field(default_factory=dict)
+    valuation: Optional[Valuation] = None
     contradiction: str = ""
     notes: List[str] = field(default_factory=list)
 
@@ -317,6 +353,9 @@ def _provider(name: str):
             sec_filings      -> providers.sec_edgar (filings + going concern)
             news             -> providers.news (RSS headlines + 8-K items)
             benchmarks       -> providers.benchmarks (index RS, sector snap)
+            analyst_estimates-> providers.bigdata (gate 7 fwd P/E + PEG)
+            literature       -> providers.consensus (evidence for/against
+                                the working claim; config-gated per scan)
     Open:   (none — all providers wired; LiteLLM models still unconfigured)
     """
     if name == "market_data":
@@ -383,6 +422,15 @@ async def fetch_universe(scan_config: Dict[str, Any]) -> List[str]:
         max_market_cap=_parse_money(mcap.get("max")),
     )
     tickers = [r["symbol"] for r in rows if r.get("symbol")]
+    # max_candidates: trim to the top-N by the screener's own ordering
+    # (Nasdaq screener sorts by volume — a liquidity ranking, not a
+    # market-cap filter). Used by wide universes like Small Cap 4x Growth.
+    max_candidates = uni.get("max_candidates")
+    if max_candidates:
+        try:
+            tickers = tickers[:int(max_candidates)]
+        except (ValueError, TypeError):
+            pass
     # test_limit: bound the universe for e2e tests (e.g. scan.test_limit: 2)
     test_limit = scan.get("test_limit")
     if test_limit:
@@ -457,15 +505,31 @@ async def fetch_fundamentals(ticker: str) -> Fundamentals:
         ticker=d["ticker"],
         revenue_ttm=d["revenue_ttm"],
         revenue_cagr_2y=d["revenue_cagr_2y"],
+        revenue_yoy_1y=d.get("revenue_yoy_1y"),
         eps_cagr_2y=d["eps_cagr_2y"],
+        eps_cagr_2y_split_adj=d.get("eps_cagr_2y_split_adj"),
+        eps_yoy_1y_split_adj=d.get("eps_yoy_1y_split_adj"),
+        eps_growth_1y=d.get("eps_yoy_1y_split_adj"),
+        eps_growth_source=("ttm_yoy"
+                           if d.get("eps_yoy_1y_split_adj") is not None
+                           else ""),
+        current_ratio=d.get("current_ratio_latest"),
+        debt_equity=d.get("debt_equity_latest"),
+        gross_margin_latest=d.get("gross_margin_latest"),
+        gross_margin_expanding=d.get("gross_margin_expanding"),
         eps_ttm=d["eps_ttm"],
         fcf_ttm=d["fcf_ttm"],
         fcf_margin=d["fcf_margin"],
+        fcf_positive_years_4=d.get("fcf_positive_years_4"),
         roic=d["roic"],
+        roic_incremental_2y=d.get("roic_incremental_2y"),
         net_debt_ebitda=d["net_debt_ebitda"],
         ebit_interest=d["ebit_interest"],
         ebitda_latest=d["ebitda_latest"],
+        ebitda_ttm=d.get("ebitda_ttm"),
         net_debt_latest=d["net_debt_latest"],
+        debt_latest=d.get("debt_latest"),
+        cash_latest=d.get("cash_latest"),
         sbc_annual=d["sbc_annual"],
         buybacks_annual=d["buybacks_annual"],
         shares_dilution_2y_pct=d["shares_dilution_2y_pct"],
@@ -474,6 +538,139 @@ async def fetch_fundamentals(ticker: str) -> Fundamentals:
         eps_history=[list(p) for p in d["eps_history"]],
         fcf_history=[list(p) for p in d["fcf_history"]],
     )
+
+
+@activity.defn
+async def fetch_valuation(ticker: str, price: Optional[float],
+                         market_cap: Optional[float]) -> Valuation:
+    """Gate 7 (forward P/E vs industry peers + PEG, via Bigdata analyst
+    estimates) and gate 8 (EV/EBITDA, FCF yield).
+
+    Never raises: a Bigdata outage degrades to a Valuation carrying error
+    text with the trailing multiples still computed, so QC treats gate 7
+    as failed-closed while gate 8 still decides.
+    """
+    from providers import bigdata, sec_edgar
+    v = Valuation(ticker=ticker.upper())
+    try:
+        g7 = bigdata.gate7(ticker, price)
+    except Exception as exc:  # noqa: BLE001 — shouldn't happen (gate7
+        g7 = {"error": f"{type(exc).__name__}: {exc}"[:200]}       # degrades)
+    if g7.get("error"):
+        v.error = g7["error"]
+    else:
+        v.fwd_pe = g7.get("fwd_pe")
+        v.ntm_eps = g7.get("ntm_eps")
+        v.fwd_growth_pct = g7.get("fwd_growth_pct")
+        v.peg = g7.get("peg")
+        v.peer_median_fwd_pe = g7.get("peer_median_fwd_pe")
+        v.discount_vs_peers_pct = g7.get("discount_vs_peers_pct")
+        v.peers_used = g7.get("peers_used")
+        v.gate7_pass = g7.get("pass")
+    try:
+        d = sec_edgar.fundamentals(ticker)  # SEC facts cached 24h
+        debt = d.get("debt_latest") or 0.0
+        cash = d.get("cash_latest") or 0.0
+        ebitda = d.get("ebitda_ttm") or d.get("ebitda_latest")
+        if market_cap and ebitda:
+            v.ev_ebitda_ttm = (market_cap + debt - cash) / ebitda
+        fcf = d.get("fcf_ttm")
+        if market_cap and fcf:
+            v.fcf_yield_ttm = fcf / market_cap
+    except Exception as exc:  # noqa: BLE001 — trailing legs optional
+        v.error = (v.error + f" | sec: {exc}"[:160]).strip(" |")
+    return v
+
+
+@activity.defn
+async def fetch_forward_growth(ticker: str) -> Dict[str, Any]:
+    """Best-effort 1-yr forward EPS growth via Bigdata analyst estimates.
+
+    Never raises: on any failure the caller keeps the TTM YoY value already
+    on the bundle and the source stays "ttm_yoy" — the two are never mixed
+    silently.
+    """
+    from providers import bigdata
+    try:
+        r = bigdata.forward_eps_growth(ticker)
+        return {"growth": r["growth"], "analysts": r["analysts"],
+                "error": ""}
+    except Exception as exc:  # noqa: BLE001 — graceful degradation
+        return {"growth": None, "analysts": 0,
+                "error": f"{type(exc).__name__}: {exc}"[:160]}
+
+
+@activity.defn
+async def enrich_consensus_evidence(report: Dict[str, Any],
+                                    bundles: List[TickerBundle],
+                                    scan_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Post-QC literature evidence for surviving picks (Consensus).
+
+    Runs ONLY on picks that survived QC — never on the whole universe. Per
+    pick it spends at most 2 queries (support + counter-evidence) and the
+    whole run is capped at 5 queries total. All queries are 24h-cached at
+    the provider layer, so re-runs of the same scan cost nothing.
+
+    - support (catalyst_quality): the literature backing the working claim —
+      the LLM's catalyst one-liner, else the deciding news headline, else
+      the pick's thesis. For a Disruptive Innovator: published evidence the
+      technology works/scales; biotech: clinical evidence.
+    - contradict (thesis_contradiction): counter-evidence phrased against
+      the working thesis ("evidence against <claim>") — the strongest
+      contradicting takeaways, alongside the LLM's own contradiction.
+
+    Never raises: a provider outage attaches {"error": ...} to the pick and
+    the scan proceeds without literature evidence.
+    """
+    from providers import consensus
+
+    by_ticker = {b.ticker.upper(): b for b in bundles}
+    picks = report.get("picks", [])
+    by_pick = {str(p.get("ticker", "")).upper(): p for p in picks}
+    budget = 5  # queries per scan run, hard cap
+
+    def claim_for(tic: str) -> str:
+        b = by_ticker.get(tic)
+        pick = by_pick.get(tic, {})
+        claim = ""
+        if b and b.catalyst_verdict:
+            claim = str((b.catalyst_verdict.get("llm", {}) or {})
+                        .get("catalyst", "") or "").strip()
+        if not claim or claim.lower() == "none":
+            claim = str((b.catalyst_verdict.get("news_verdict", {}) or {})
+                        .get("headline", "") or "").strip() if b else ""
+        if not claim:
+            claim = str(pick.get("thesis", "")).strip()
+        return claim[:300]
+
+    for pick in picks:
+        tic = str(pick.get("ticker", "")).upper()
+        claim = claim_for(tic)
+        evidence: Dict[str, Any] = {"queries": {}, "support": [],
+                                    "contradict": [], "error": ""}
+        if not claim:
+            evidence["error"] = "no claim to search"
+        else:
+            queries = (("support", claim),
+                       ("contradict", f"evidence against {claim}"))
+            for kind, q in queries:
+                if budget <= 0:
+                    break
+                budget -= 1
+                evidence["queries"][kind] = q
+                try:
+                    r = consensus.search(q)
+                    if r.get("error"):
+                        evidence["error"] += f"{kind}: {r['error']}; "
+                    else:
+                        evidence[kind] = consensus.parse_papers(r)
+                except Exception as exc:  # noqa: BLE001 — fail closed
+                    evidence["error"] += f"{kind}: {type(exc).__name__}; "
+            evidence["error"] = evidence["error"].strip()
+            if budget <= 0 and not evidence["error"]:
+                evidence["error"] = "query budget exhausted"
+        pick["consensus_evidence"] = evidence
+    return report
 
 
 @activity.defn
@@ -813,43 +1010,143 @@ def _parse_pct(value) -> float | None:
 
 
 def _criteria_checks(bundle: TickerBundle, scan: dict) -> list[tuple[str, bool]]:
-    """(criterion, passed) for every hard filter + universe gate."""
+    """(criterion, passed) for every hard filter + universe gate.
+
+    Every check applies only when its filter is configured: a scan that
+    doesn't ask for a float cap, RVOL, or a catalyst verdict must not fail
+    tickers for lacking them (previously every Large Cap pick failed QC on
+    the micro-cap gates).
+    """
     hf = scan.get("hard_filters", {})
     uni = scan.get("universe", {})
     t = bundle.technicals
     checks: list[tuple[str, bool]] = []
     mc = uni.get("market_cap", {})
-    checks.append(("market_cap_range",
-                   (bundle.market_cap or 0) >= (_parse_money(mc.get("min")) or 0)
-                   and (bundle.market_cap or 0) <= (_parse_money(mc.get("max")) or float("inf"))))
+    if mc.get("min") is not None or mc.get("max") is not None:
+        checks.append(("market_cap_range",
+                       (bundle.market_cap or 0) >= (_parse_money(mc.get("min")) or 0)
+                       and (bundle.market_cap or 0) <= (_parse_money(mc.get("max")) or float("inf"))))
     pr = hf.get("price", {})
-    checks.append(("price_range",
-                   (bundle.price or 0) >= (pr.get("min") or 0)
-                   and (bundle.price or 0) <= (pr.get("max") or float("inf"))))
+    if pr.get("min") is not None or pr.get("max") is not None:
+        checks.append(("price_range",
+                       (bundle.price or 0) >= (pr.get("min") or 0)
+                       and (bundle.price or 0) <= (pr.get("max") or float("inf"))))
     fl = hf.get("float", {})
-    checks.append(("float",
-                   bundle.float_shares is not None
-                   and bundle.float_shares <= (_parse_money(fl.get("max")) or float("inf"))))
+    if fl.get("max") is not None:
+        checks.append(("float",
+                       bundle.float_shares is not None
+                       and bundle.float_shares <= (_parse_money(fl.get("max")) or float("inf"))))
     rv = hf.get("relative_volume", {})
-    checks.append(("rvol",
-                   t is not None and t.rvol is not None
-                   and t.rvol >= (rv.get("min") or 0)))
+    if rv.get("min") is not None:
+        checks.append(("rvol",
+                       t is not None and t.rvol is not None
+                       and t.rvol >= (rv.get("min") or 0)))
     dm = hf.get("daily_move", {})
-    checks.append(("daily_move",
-                   t is not None and t.day_change_pct is not None
-                   and t.day_change_pct >= (_parse_pct(dm.get("min")) or 0)))
+    if dm.get("min") is not None:
+        checks.append(("daily_move",
+                       t is not None and t.day_change_pct is not None
+                       and t.day_change_pct >= (_parse_pct(dm.get("min")) or 0)))
     vo = hf.get("volume", {})
-    # hard filter is the session's volume (RVOL covers the average leg)
-    vol = t.volume if t else None
-    checks.append(("volume", vol is not None
-                   and vol >= (vo.get("min") or 0)))
+    if vo.get("min") is not None:
+        # hard filter is the session's volume (RVOL covers the average leg)
+        vol = t.volume if t else None
+        checks.append(("volume", vol is not None
+                       and vol >= (vo.get("min") or 0)))
     ca = hf.get("catalyst_age", {})
-    nv = (bundle.catalyst_verdict or {}).get("news_verdict", {})
-    age = nv.get("age_days")
-    checks.append(("catalyst",
-                   nv.get("verdict") == "material"
-                   and age is not None
-                   and age <= (ca.get("max_days") or float("inf"))))
+    if ca.get("max_days") is not None:
+        nv = (bundle.catalyst_verdict or {}).get("news_verdict", {})
+        age = nv.get("age_days")
+        checks.append(("catalyst",
+                       nv.get("verdict") == "material"
+                       and age is not None
+                       and age <= (ca.get("max_days") or float("inf"))))
+    ad = hf.get("above_200dma", {})
+    if ad.get("require"):
+        checks.append(("above_200dma",
+                       t is not None and t.sma200 is not None
+                       and (bundle.price or 0) > t.sma200))
+
+    # --- fundamentals hard filters (11-gate screen; each applies only when
+    # configured). Missing/uncomputable values fail closed.
+    f = bundle.fundamentals
+    val = bundle.valuation
+    ro = hf.get("roic", {})
+    if ro.get("min") is not None:
+        thr = _parse_pct(ro.get("min"))
+        checks.append(("roic_min",
+                       f is not None and f.roic is not None
+                       and thr is not None and f.roic >= thr))
+    rc = hf.get("revenue_cagr", {})
+    if rc.get("min") is not None:
+        thr = _parse_pct(rc.get("min"))
+        checks.append(("revenue_cagr_min",
+                       f is not None and f.revenue_cagr_2y is not None
+                       and thr is not None and f.revenue_cagr_2y >= thr))
+    ec = hf.get("eps_cagr", {})
+    if ec.get("min") is not None:
+        thr = _parse_pct(ec.get("min"))
+        checks.append(("eps_cagr_min",
+                       f is not None
+                       and f.eps_cagr_2y_split_adj is not None
+                       and thr is not None
+                       and f.eps_cagr_2y_split_adj >= thr))
+    ff = hf.get("fcf", {})
+    if ff.get("positive_years") is not None or ff.get("margin_min") is not None:
+        ok_years = (f is not None and f.fcf_positive_years_4 is not None
+                    and f.fcf_positive_years_4 >= int(ff.get("positive_years", 0)))
+        mthr = _parse_pct(ff.get("margin_min"))
+        ok_margin = (f is not None and f.fcf_margin is not None
+                     and mthr is not None and f.fcf_margin >= mthr) \
+            if ff.get("margin_min") is not None else True
+        checks.append(("fcf_history_margin", ok_years and ok_margin))
+    nd = hf.get("net_debt_ebitda", {})
+    if nd.get("max") is not None:
+        checks.append(("leverage_max",
+                       f is not None and f.net_debt_ebitda is not None
+                       and f.net_debt_ebitda <= float(nd.get("max"))))
+    ei = hf.get("ebit_interest", {})
+    if ei.get("min") is not None:
+        checks.append(("coverage_min",
+                       f is not None and f.ebit_interest is not None
+                       and f.ebit_interest >= float(ei.get("min"))))
+    va = hf.get("valuation", {})
+    if va.get("ev_ebitda_max") is not None or va.get("fcf_yield_min") is not None:
+        ev_ok = (val is not None and val.ev_ebitda_ttm is not None
+                 and va.get("ev_ebitda_max") is not None
+                 and val.ev_ebitda_ttm <= float(va["ev_ebitda_max"]))
+        ythr = _parse_pct(va.get("fcf_yield_min"))
+        fy_ok = (val is not None and val.fcf_yield_ttm is not None
+                 and ythr is not None and val.fcf_yield_ttm >= ythr)
+        checks.append(("valuation_gate8", ev_ok or fy_ok))
+    g7 = hf.get("gate7", {})
+    if g7.get("require_pass"):
+        checks.append(("gate7_forward_value",
+                       val is not None and val.gate7_pass is True))
+
+    # --- Small Cap 4x Growth gates (each applies only when configured).
+    # Missing/uncomputable values fail closed.
+    ry = hf.get("revenue_yoy", {})
+    if ry.get("min") is not None:
+        thr = _parse_pct(ry.get("min"))
+        checks.append(("revenue_yoy_min",
+                       f is not None and f.revenue_yoy_1y is not None
+                       and thr is not None and f.revenue_yoy_1y >= thr))
+    eg = hf.get("eps_growth", {})
+    if eg.get("min") is not None:
+        thr = _parse_pct(eg.get("min"))
+        checks.append(("eps_growth_min",
+                       f is not None and f.eps_growth_1y is not None
+                       and thr is not None and f.eps_growth_1y >= thr))
+    cr = hf.get("current_ratio", {})
+    if cr.get("min") is not None:
+        checks.append(("current_ratio_min",
+                       f is not None and f.current_ratio is not None
+                       and f.current_ratio >= float(cr.get("min"))))
+    de = hf.get("debt_equity", {})
+    if de.get("max") is not None:
+        checks.append(("debt_equity_max",
+                       f is not None and f.debt_equity is not None
+                       and f.debt_equity <= float(de.get("max"))))
     return checks
 
 

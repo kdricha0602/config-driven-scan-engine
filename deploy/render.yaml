@@ -6,7 +6,7 @@ services:
     name: scan-tier-render
     runtime: docker
     dockerfilePath: ./deploy/Dockerfile
-    dockerContext: ./files
+    dockerContext: .
     plan: free
     healthCheckPath: /ready
     envVars:

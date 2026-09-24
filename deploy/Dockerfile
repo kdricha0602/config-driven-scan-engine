@@ -19,7 +19,7 @@ RUN pip install -r engine/requirements.txt
 
 COPY engine/ ./engine/
 COPY scan-configs.yaml ./
-COPY INTEGRITY_CHARTER.md ./
+COPY docs/INTEGRITY_CHARTER.md ./
 
 WORKDIR /app/engine
 

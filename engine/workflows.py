@@ -37,13 +37,16 @@ with workflow.unsafe.imports_passed_through():
         compute_relative_strength,
         compute_technicals,
         contradict_thesis,
+        enrich_consensus_evidence,
         fetch_float,
+        fetch_forward_growth,
         fetch_fundamentals,
         fetch_market_data,
         fetch_news,
         fetch_quote,
         fetch_sec_filings,
         fetch_universe,
+        fetch_valuation,
         interpret_catalyst,
         quality_control,
         synthesize,
@@ -124,6 +127,31 @@ class ResearchTickerWorkflow:
                 bundle.market_cap = bundle.price * shares_out
         except Exception:
             pass
+
+        # Gate 7 (forward value) + gate 8 (trailing multiples). Runs after
+        # price/market cap are known; degrades gracefully on Bigdata outage.
+        if analytics.get("valuation", True):
+            bundle.valuation = await workflow.execute_activity(
+                fetch_valuation,
+                args=[ticker, bundle.price, bundle.market_cap],
+                start_to_close_timeout=timedelta(minutes=5))
+
+        # Forward EPS growth (Small Cap 4x Growth): prefer analyst estimates
+        # when obtainable; otherwise the TTM YoY value already on the bundle
+        # stands and the source stays "ttm_yoy" — never mixed silently.
+        if analytics.get("forward_eps_growth", False) and bundle.fundamentals:
+            fg = await workflow.execute_activity(
+                fetch_forward_growth, ticker,
+                start_to_close_timeout=timedelta(minutes=3))
+            if fg.get("growth") is not None:
+                bundle.fundamentals.eps_growth_1y = fg["growth"]
+                bundle.fundamentals.eps_growth_source = "forward_estimates"
+                bundle.fundamentals.eps_growth_analysts = fg.get("analysts", 0)
+                bundle.notes.append(
+                    f"eps_growth: forward estimates ({fg.get('analysts', 0)} analysts)")
+            else:
+                bundle.notes.append(
+                    "eps_growth: TTM YoY fallback (no forward estimates)")
 
         # Dilution / supply-overhang screen from filings (deterministic).
         bundle.notes.append(
@@ -211,6 +239,15 @@ class ScanWorkflow:
         report = await workflow.execute_activity(
             quality_control, args=[report, bundles, cfg],
             start_to_close_timeout=timedelta(minutes=2))
+
+        # Consensus literature evidence: post-QC picks ONLY (never the
+        # whole universe), budgeted to ~5 queries per scan run, 24h-cached.
+        # Default OFF — enabled per scan via analytics.consensus_evidence.
+        if analytics.get("consensus_evidence", False):
+            report = await workflow.execute_activity(
+                enrich_consensus_evidence,
+                args=[report, bundles, cfg],
+                start_to_close_timeout=timedelta(minutes=10))
         return report
 
 

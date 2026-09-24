@@ -80,16 +80,30 @@ scans:
 
       hard_filters:
         roic:
-          min: 13%
+          min: 14%
 
         revenue_cagr:
           min: 9%
 
+        eps_cagr:
+          min: 9%
+
         fcf:
-          positive_years: 2
+          positive_years: 3
+          margin_min: 6%
 
         net_debt_ebitda:
-          max: 1.6
+          max: 2.75
+
+        ebit_interest:
+          min: 3.5
+
+        valuation:
+          ev_ebitda_max: 15
+          fcf_yield_min: 4%
+
+        gate7:
+          require_pass: true
 
       analytics:
         technicals: true
@@ -100,6 +114,47 @@ scans:
         valuation: true
         thesis_contradiction: true
         data_confidence: true
+
+      output:
+        top_candidates: 5
+
+  - scan:
+      name: "Small Cap 4x Growth"
+
+      # No market-cap filter (Korben 2026-09-23 revision): the $2-$25 price
+      # band plus a liquidity-ranked candidate cap define the universe.
+      universe:
+        max_candidates: 1200
+
+      hard_filters:
+        price:
+          min: 2
+          max: 25
+
+        above_200dma:
+          require: true
+
+        revenue_yoy:
+          min: 30%
+
+        eps_growth:
+          min: 25%
+
+        current_ratio:
+          min: 1.5
+
+        debt_equity:
+          max: 0.5
+
+      analytics:
+        technicals: true
+        catalyst_quality: true
+        relative_strength: true
+        fundamentals: true
+        forward_eps_growth: true
+        thesis_contradiction: true
+        data_confidence: true
+        consensus_evidence: true
 
       output:
         top_candidates: 5

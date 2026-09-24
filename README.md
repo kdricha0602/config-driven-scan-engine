@@ -7,7 +7,7 @@ This is an independent personal project. Not financial advice.
 ## Architecture
 
 ```
-configs/scan-configs.yaml
+scan-configs.yaml
         │  what does this hunt care about?
         ▼
 Temporal workflows  →  per-ticker child workflows (parallel, retried)
