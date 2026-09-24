@@ -6,6 +6,7 @@ Endpoints:
   GET  /health                  liveness (no DB touch)
   GET  /ready                   readiness (DB reachable)
   POST /internal/run-due-scans  watchdog trigger; X-Watchdog-Secret required
+                                (returns immediately; scans run in background)
   GET  /internal/watermark/{scan}  debug: last watermark for a scan
 """
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -138,13 +140,38 @@ def _start_temporal_scan(scan_name: str) -> dict:
 def run_due_scans(body: TriggerBody,
                   x_watchdog_secret: str | None = Header(default=None)):
     _check_secret(x_watchdog_secret)
+    if not failover.DATABASE_URL:
+        # Fail closed, synchronously: without shared state nothing runs.
+        raise HTTPException(
+            status_code=500,
+            detail="DATABASE_URL is not set — refusing to run without "
+                   "shared state (fail closed).")
+    thread = threading.Thread(target=_run_due_scans_bg, args=(body,),
+                              name=f"due-scans-{body.run_id}", daemon=True)
+    thread.start()
+    return {"accepted": True, "tier": TIER_NAME,
+            "triggered_by": body.triggered_by, "run_id": body.run_id}
+
+
+def _run_due_scans_bg(body: TriggerBody) -> None:
+    """Background worker for POST /internal/run-due-scans.
+
+    Claims leadership, runs every due scan, persists watermarks/results.
+    Runs in a thread so the HTTP trigger returns immediately: the
+    watchdog's curl gives up after 120s, but a full scan takes many
+    minutes, so a synchronous endpoint could never succeed. Duplicate
+    triggers are harmless — the Postgres advisory lock lets exactly one
+    thread scan; the rest audit 'leader_contended' and exit.
+    """
     try:
         summary = failover.run_due_scans(
             tier=TIER_NAME, runner=_start_temporal_scan)
     except RuntimeError as exc:
-        # e.g. DATABASE_URL missing -> fail closed, watchdog sees 500
-        raise HTTPException(status_code=500, detail=str(exc))
+        # e.g. DATABASE_URL missing -> fail closed, recorded for forensics
+        failover.audit(TIER_NAME, "watchdog_trigger_failed",
+                       {"by": body.triggered_by, "run_id": body.run_id,
+                        "error": str(exc)[:500]})
+        return
     failover.audit(TIER_NAME, "watchdog_trigger",
                    {"by": body.triggered_by, "run_id": body.run_id,
                     "summary": summary})
-    return summary

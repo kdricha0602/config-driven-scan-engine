@@ -2,6 +2,10 @@
 # on the first healthy one. External to every tier, so a sleeping or dead tier
 # is never a single point of failure.
 #
+# NOTE: the tier's trigger endpoint answers immediately (202-style accept);
+# scans run in a background thread there, so the probe's 120s curl budget is
+# never the limiting factor.
+#
 # Required repository secrets:
 #   TIER1_URL, TIER2_URL, TIER3_URL   base URLs, e.g. https://scan-t1.onrender.com
 #   WATCHDOG_SECRET                    shared secret, also set as env on every tier

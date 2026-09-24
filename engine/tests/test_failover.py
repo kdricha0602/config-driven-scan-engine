@@ -180,6 +180,17 @@ class TestWatermark:
 # Tier API (TestClient, Temporal call mocked out)
 # ---------------------------------------------------------------------------
 
+def _wait_for(pred, timeout=5.0):
+    """Poll a predicate until true (background-thread assertions)."""
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.05)
+    return bool(pred())
+
+
 class TestTierAPI:
     @pytest.fixture
     def client(self, monkeypatch):
@@ -204,10 +215,13 @@ class TestTierAPI:
                    json={"triggered_by": "t", "run_id": "1"})
         assert r.status_code == 403
 
-    def test_trigger_runs_due_scans(self, client, monkeypatch, fake_db):
+    def test_trigger_accepts_and_runs_due_scans_in_background(
+            self, client, monkeypatch, fake_db):
         c, api_mod = client
-        monkeypatch.setattr(failover, "audit", lambda *a, **k: None)
-        monkeypatch.setattr(failover, "get_watermark", lambda name: None)
+        audits = []
+        monkeypatch.setattr(
+            failover, "audit",
+            lambda tier, event, detail=None: audits.append(event))
         # freeze "now" to a Monday 7:05am CT -> premarket due
         monkeypatch.setattr(failover, "get_due_scans",
                             lambda now=None: ["premarket-7am"])
@@ -219,15 +233,49 @@ class TestTierAPI:
                    json={"triggered_by": "t", "run_id": "1"})
         assert r.status_code == 200
         body = r.json()
-        assert body["leader"] is True
-        assert ran == ["premarket-7am"]
+        assert body["accepted"] is True
+        assert body["tier"] == "test-tier"
+        # the scan itself happens in the background thread
+        assert _wait_for(lambda: ran == ["premarket-7am"])
+        assert _wait_for(lambda: "watchdog_trigger" in audits)
 
-    def test_trigger_contended_leader(self, client, monkeypatch, fake_db):
+    def test_trigger_returns_before_slow_scan_finishes(
+            self, client, monkeypatch, fake_db):
+        import time
+        c, api_mod = client
+        monkeypatch.setattr(failover, "audit", lambda *a, **k: None)
+        monkeypatch.setattr(failover, "get_due_scans",
+                            lambda now=None: ["premarket-7am"])
+        started = []
+
+        def slow_runner(name):
+            started.append(name)
+            time.sleep(2)  # longer than any watchdog curl timeout
+            return {"ok": True}
+
+        monkeypatch.setattr(api_mod, "_start_temporal_scan", slow_runner)
+        t0 = time.time()
+        r = c.post("/internal/run-due-scans",
+                   headers={"X-Watchdog-Secret": "test-secret"},
+                   json={"triggered_by": "t", "run_id": "1"})
+        elapsed = time.time() - t0
+        assert r.status_code == 200
+        assert r.json()["accepted"] is True
+        # the old synchronous endpoint would have blocked the full 2s
+        assert elapsed < 1.5
+        assert _wait_for(lambda: started == ["premarket-7am"], timeout=5)
+
+    def test_trigger_contended_leader_still_accepts(
+            self, client, monkeypatch, fake_db):
         c, _ = client
         fake_db.lock_result = False
-        monkeypatch.setattr(failover, "audit", lambda *a, **k: None)
+        audits = []
+        monkeypatch.setattr(
+            failover, "audit",
+            lambda tier, event, detail=None: audits.append(event))
         r = c.post("/internal/run-due-scans",
                    headers={"X-Watchdog-Secret": "test-secret"},
                    json={"triggered_by": "t", "run_id": "1"})
         assert r.status_code == 200
-        assert r.json()["leader"] is False
+        assert r.json()["accepted"] is True
+        assert _wait_for(lambda: "leader_contended" in audits)
