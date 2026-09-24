@@ -57,15 +57,20 @@ scans:
         catalyst_age:
           max_days: 7
 
+  # TEMPORARY deterministic mode (2026-09-24): no LLM_API_KEY on the tier yet,
+  # so the three LiteLLM activities are off. Scans run the full deterministic
+  # pipeline (universe, technicals, fundamentals, valuation, QC) and complete
+  # with real picks. Re-enable when a key is set on the tier.
       analytics:
         technicals: true
-        catalyst_quality: true
+        catalyst_quality: false
         dilution: true
         relative_strength: true
         fundamentals: true
         valuation: true
-        thesis_contradiction: true
+        thesis_contradiction: false
         data_confidence: true
+        synthesis: false
 
       output:
         top_candidates: 5
@@ -107,13 +112,14 @@ scans:
 
       analytics:
         technicals: true
-        catalyst_quality: true
+        catalyst_quality: false
         dilution: true
         relative_strength: true
         fundamentals: true
         valuation: true
-        thesis_contradiction: true
+        thesis_contradiction: false
         data_confidence: true
+        synthesis: false
 
       output:
         top_candidates: 5
@@ -148,13 +154,14 @@ scans:
 
       analytics:
         technicals: true
-        catalyst_quality: true
+        catalyst_quality: false
         relative_strength: true
         fundamentals: true
         forward_eps_growth: true
-        thesis_contradiction: true
+        thesis_contradiction: false
         data_confidence: true
         consensus_evidence: true
+        synthesis: false
 
       output:
         top_candidates: 5

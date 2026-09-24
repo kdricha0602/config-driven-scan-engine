@@ -15,16 +15,56 @@ import hashlib
 import hmac
 import os
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 import failover
+import yaml
 
 TIER_NAME = os.environ.get("TIER_NAME", "local")
 WATCHDOG_SECRET = os.environ.get("WATCHDOG_SECRET", "")
 TEMPORAL_ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+
+# Schedule name (failover.SCAN_SCHEDULES) -> scan "name" in scan-configs.yaml.
+# The watchdog only knows schedule names; the workflow needs the full config.
+SCHEDULE_TO_SCAN = {
+    "premarket-7am": "Micro Cap Momentum",
+    "weekday-equity-scan": "Large Cap Compounders",
+    "hourly-watch": "Micro Cap Momentum",
+    "eod-scan": "Large Cap Compounders",
+    "midcap-pipeline": "Small Cap 4x Growth",
+}
+
+
+def _configs_path() -> Path:
+    """Locate scan-configs.yaml: env override, then next to the engine dir."""
+    env = os.environ.get("SCAN_CONFIGS_PATH")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve().parent  # .../engine
+    for cand in (here.parent / "scan-configs.yaml",  # deployed: /app/scan-configs.yaml
+                 Path.cwd() / "scan-configs.yaml"):
+        if cand.exists():
+            return cand
+    raise RuntimeError("scan-configs.yaml not found")
+
+
+def _load_scan_config(scan_name: str) -> dict:
+    """Resolve a schedule name to its full scan config dict."""
+    want = SCHEDULE_TO_SCAN.get(scan_name)
+    if not want:
+        raise RuntimeError(f"no scan configured for schedule '{scan_name}'")
+    with open(_configs_path()) as fh:
+        doc = yaml.safe_load(fh)
+    for entry in doc.get("scans", []):
+        scan = entry.get("scan", {})
+        if scan.get("name") == want:
+            cfg = {"engine_rules": doc.get("engine_rules", {}), "scan": scan}
+            return cfg
+    raise RuntimeError(f"scan '{want}' not found in scan-configs.yaml")
 
 app = FastAPI(title="scan-tier", version="1.0.0")
 
@@ -79,11 +119,13 @@ def _start_temporal_scan(scan_name: str) -> dict:
 
     import asyncio
 
+    cfg = _load_scan_config(scan_name)
+
     async def _run() -> dict:
         client = await Client.connect(TEMPORAL_ADDRESS)
         handle = await client.start_workflow(
             "ScanWorkflow",
-            {"scan_name": scan_name},
+            {"scan_config": cfg},
             id=f"scan-{scan_name}-{TIER_NAME}-{int(datetime.now().timestamp())}",
             task_queue="equity-scans",
         )
