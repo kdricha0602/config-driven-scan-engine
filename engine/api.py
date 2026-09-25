@@ -155,6 +155,14 @@ def run_due_scans(body: TriggerBody,
 
 def _run_due_scans_bg(body: TriggerBody) -> None:
     """Background worker for POST /internal/run-due-scans.
+    ...
+    """
+    print(f"BACKGROUND THREAD STARTED: {body.run_id}", flush=True)
+
+    try:
+        summary = failover.run_due_scans(
+            tier=TIER_NAME, runner=_start_temporal_scan)
+    """Background worker for POST /internal/run-due-scans.
 
     Claims leadership, runs every due scan, persists watermarks/results.
     Runs in a thread so the HTTP trigger returns immediately: the
