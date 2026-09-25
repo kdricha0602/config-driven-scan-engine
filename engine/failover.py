@@ -13,251 +13,409 @@ nothing scans. A tier that cannot prove leadership stays quiet.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import hmac
 import os
-from datetime import datetime, time as dtime, timedelta
-from typing import Callable
+import threading
+from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
-CT = ZoneInfo("America/Chicago")
+import yaml
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+from pydantic import BaseModel
+from temporalio.client import Client
+
+import failover
+
+
+# ---------------------------------------------------------------------------
+# Environment / deployment configuration
+# ---------------------------------------------------------------------------
 
 TIER_NAME = os.environ.get("TIER_NAME", "local")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+WATCHDOG_SECRET = os.environ.get("WATCHDOG_SECRET")
+TEMPORAL_ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
 
-# One constant per deployment — every tier contends for the same lock.
-LEADER_LOCK_ID = 987654
 
-# stage order for resume logic
-STAGES = ["universe", "filters", "analysis", "synthesis", "done"]
+# ---------------------------------------------------------------------------
+# Schedule → scan mapping
+# ---------------------------------------------------------------------------
 
-# Scan schedules, mirroring Korben's standing commitments. The watchdog is
-# dumb (probe + trigger); the tier decides what is due. Times are
-# America/Chicago; weekdays only (US market holidays are not modeled —
-# a holiday just yields an empty scan, which is safe).
-SCAN_SCHEDULES = {
-    # name: (kind, params)
-    "premarket-7am": ("daily", {"at": dtime(7, 0)}),
-    "weekday-equity-scan": ("daily", {"at": dtime(8, 42)}),
-    "hourly-watch": ("hourly", {"minute": 7, "from": dtime(8, 30),
-                                "to": dtime(15, 30)}),
-    "eod-scan": ("daily", {"at": dtime(15, 45)}),
-    "midcap-pipeline": ("monthly", {"day": 3, "at": dtime(9, 0)}),
+SCHEDULE_TO_SCAN = {
+    "premarket-7am": "Micro Cap Momentum",
+    "weekday-equity-scan": "Large Cap Compounders",
+    "hourly-watch": "Micro Cap Momentum",
+    "eod-scan": "Large Cap Compounders",
+    "midcap-pipeline": "Small Cap 4x Growth",
 }
 
 
-def get_conn():
-    """Connect to the shared Postgres. Raises RuntimeError if unconfigured."""
-    if not DATABASE_URL:
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+SECRET_HASH = (
+    hashlib.sha256(WATCHDOG_SECRET.encode()).hexdigest()
+    if WATCHDOG_SECRET
+    else None
+)
+
+
+def _check_secret(provided: str | None) -> None:
+    """Fail-closed timing-safe watchdog authentication."""
+
+    if not SECRET_HASH:
+        raise HTTPException(
+            status_code=503,
+            detail="Watchdog auth not configured globally",
+        )
+
+    if not provided:
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Missing authorization header",
+        )
+
+    provided_hash = hashlib.sha256(provided.encode()).hexdigest()
+
+    if not hmac.compare_digest(provided_hash, SECRET_HASH):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Invalid credentials",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Scan configuration
+# ---------------------------------------------------------------------------
+
+def _configs_path() -> Path:
+    """Locate scan-configs.yaml using environment override or known anchors."""
+
+    env = os.environ.get("SCAN_CONFIGS_PATH")
+
+    if env:
+        return Path(env)
+
+    here = Path(__file__).resolve().parent
+
+    candidates = [
+        here.parent / "scan-configs.yaml",
+        here / "scan-configs.yaml",
+        Path.cwd() / "scan-configs.yaml",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    raise RuntimeError(
+        "scan-configs.yaml configuration file not found"
+    )
+
+
+def _load_scan_config(scan_name: str) -> dict:
+    """Resolve a schedule name to its complete scan configuration."""
+
+    target_scan = SCHEDULE_TO_SCAN.get(scan_name)
+
+    if not target_scan:
         raise RuntimeError(
-            "DATABASE_URL is not set — refusing to run without shared state "
-            "(fail closed).")
-    import psycopg
-    return psycopg.connect(DATABASE_URL, connect_timeout=10)
+            f"No scan configured for schedule '{scan_name}'"
+        )
 
+    config_path = _configs_path()
 
-def try_become_leader(tier: str = TIER_NAME):
-    """Try to claim the global scan lock.
+    with open(config_path, "r", encoding="utf-8") as fh:
+        document = yaml.safe_load(fh) or {}
 
-    Returns an open connection holding the lock (caller must close it to
-    release), or None if another tier is already leader.
-    """
-    conn = get_conn()
-    try:
-        row = conn.execute(
-            "SELECT pg_try_advisory_lock(%s)", (LEADER_LOCK_ID,)).fetchone()
-        leader = bool(row[0])
-        conn.execute(
-            """INSERT INTO tier_heartbeat (tier, last_beat, is_leader)
-               VALUES (%s, now(), %s)
-               ON CONFLICT (tier)
-               DO UPDATE SET last_beat = now(), is_leader = %s""",
-            (tier, leader, leader))
-        conn.commit()
-        if not leader:
-            conn.close()
-            return None
-        return conn
-    except Exception:
-        conn.close()
-        raise
+    for entry in document.get("scans", []):
+        scan = entry.get("scan", {})
 
+        if scan.get("name") == target_scan:
+            return {
+                "engine_rules": document.get("engine_rules", {}),
+                "scan": scan,
+            }
 
-def write_heartbeat(tier: str = TIER_NAME, is_leader: bool = False) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO tier_heartbeat (tier, last_beat, is_leader)
-               VALUES (%s, now(), %s)
-               ON CONFLICT (tier)
-               DO UPDATE SET last_beat = now(), is_leader = %s""",
-            (tier, is_leader, is_leader))
-
-
-def record_stage(scan_name: str, stage: str,
-                 result_ref: str | None = None) -> None:
-    """Persist how far a scan got — the next tier resumes from here."""
-    assert stage in STAGES, f"unknown stage {stage!r}"
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO scan_watermark (scan_name, last_stage, last_run, result_ref)
-               VALUES (%s, %s, now(), %s)
-               ON CONFLICT (scan_name)
-               DO UPDATE SET last_stage = EXCLUDED.last_stage,
-                             last_run = EXCLUDED.last_run,
-                             result_ref = EXCLUDED.result_ref""",
-            (scan_name, stage, result_ref))
-
-
-def get_watermark(scan_name: str) -> dict | None:
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT scan_name, last_stage, last_run, result_ref "
-            "FROM scan_watermark WHERE scan_name = %s",
-            (scan_name,)).fetchone()
-    if not row:
-        return None
-    return {"scan_name": row[0], "last_stage": row[1],
-            "last_run": row[2], "result_ref": row[3]}
-
-
-def save_result(scan_name: str, tier: str, payload: dict) -> int:
-    """Persist a completed analysis. Returns the new row id."""
-    import json
-    with get_conn() as conn:
-        row = conn.execute(
-            "INSERT INTO scan_results (scan_name, ran_on_tier, payload) "
-            "VALUES (%s, %s, %s) RETURNING id",
-            (scan_name, tier, json.dumps(payload, default=str))).fetchone()
-        return int(row[0])
-
-
-def should_alert(ticker: str) -> bool:
-    """True once per ticker per hour — enforced by the DB primary key.
-
-    A racing tier's duplicate INSERT raises UniqueViolation and returns
-    False: the second alert is never sent, no matter the code path.
-    """
-    import psycopg
-    with get_conn() as conn:
-        try:
-            conn.execute(
-                """INSERT INTO alert_dedup (ticker, hour_bucket)
-                   VALUES (%s, date_trunc('hour', now()))""",
-                (ticker.upper(),))
-            return True
-        except psycopg.errors.UniqueViolation:
-            conn.rollback()
-            return False
-
-
-def audit(tier: str, event: str, detail: dict | None = None) -> None:
-    import json
-    try:
-        with get_conn() as conn:
-            conn.execute(
-                "INSERT INTO audit_log (tier, event, detail) "
-                "VALUES (%s, %s, %s)",
-                (tier, event, json.dumps(detail or {}, default=str)))
-    except Exception:
-        pass  # audit must never break the scan
+    raise RuntimeError(
+        f"Scan target '{target_scan}' not found in {config_path}"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Due-scan scheduling
+# Request models
 # ---------------------------------------------------------------------------
 
-def _is_weekday(now: datetime) -> bool:
-    return now.weekday() < 5
+class TriggerBody(BaseModel):
+    triggered_by: str = "unknown"
+    run_id: str = "n/a"
 
 
-def is_due(scan_name: str, now: datetime,
-           last_run: datetime | None) -> bool:
-    """Has this scan's schedule fired since last_run? Pure function, tested."""
-    kind, p = SCAN_SCHEDULES[scan_name]
-    now = now.astimezone(CT)
-    if last_run is not None:
-        last_run = last_run.astimezone(CT)
+# ---------------------------------------------------------------------------
+# FastAPI application state
+# ---------------------------------------------------------------------------
 
-    if kind == "daily":
-        if not _is_weekday(now):
-            return False
-        fired_today = now.time() >= p["at"]
-        ran_today = (last_run is not None and last_run.date() == now.date())
-        return fired_today and not ran_today
+app = FastAPI(
+    title="scan-tier",
+    version="1.0.0",
+)
 
-    if kind == "hourly":
-        if not _is_weekday(now):
-            return False
-        if not (p["from"] <= now.time() <= p["to"]):
-            return False
-        if now.minute < p["minute"]:
-            return False  # this hour's slot hasn't fired yet
-        if last_run is None:
-            return True
-        # due if last run was before this hour's slot
-        slot = now.replace(minute=p["minute"], second=0, microsecond=0)
-        return last_run < slot
-
-    if kind == "monthly":
-        # Effective fire day: the 3rd, rolled forward past weekends so a
-        # month never silently skips when the 3rd falls on Sat/Sun.
-        eff = now.replace(day=p["day"])
-        while eff.weekday() >= 5:
-            eff += timedelta(days=1)
-        if now.date() != eff.date():
-            return False
-        fired = now.time() >= p["at"]
-        ran_this_month = (last_run is not None
-                          and (last_run.year, last_run.month)
-                          == (now.year, now.month))
-        return fired and not ran_this_month
-
-    return False
+temporal_client: Client | None = None
+main_event_loop: asyncio.AbstractEventLoop | None = None
 
 
-def get_due_scans(now: datetime | None = None) -> list[str]:
-    """Scan names whose schedule has fired since their watermark."""
-    now = (now or datetime.now(CT)).astimezone(CT)
-    due = []
-    for name in SCAN_SCHEDULES:
-        wm = get_watermark(name)
-        last = wm["last_run"] if wm else None
-        # a crashed mid-scan run (watermark not 'done') is always re-due
-        if wm and wm["last_stage"] != "done":
-            due.append(name)
-        elif is_due(name, now, last):
-            due.append(name)
-    return due
+# ---------------------------------------------------------------------------
+# Startup / shutdown
+# ---------------------------------------------------------------------------
 
-
-def run_due_scans(tier: str = TIER_NAME,
-                  runner: Callable[[str], dict] | None = None,
-                  now: datetime | None = None) -> dict:
-    """Claim leadership, run every due scan, release. The failover entrypoint.
-
-    `runner(scan_name)` performs one scan and returns its report payload.
-    Returns a summary dict; raises RuntimeError if leadership can't be had.
+@app.on_event("startup")
+async def startup_event():
     """
-    conn = try_become_leader(tier)
-    if conn is None:
-        audit(tier, "leader_contended", {})
-        return {"leader": False, "tier": tier}
+    Establish the shared Temporal client and retain the FastAPI event loop.
+
+    The event loop reference allows synchronous failover workers to safely
+    submit Temporal coroutines back onto this loop.
+    """
+
+    global temporal_client
+    global main_event_loop
+
+    main_event_loop = asyncio.get_running_loop()
+
     try:
-        write_heartbeat(tier, True)
-        due = get_due_scans(now)
-        results = []
-        for name in due:
-            try:
-                record_stage(name, "universe")
-                payload = runner(name) if runner else {"scan": name,
-                                                      "note": "no runner wired"}
-                rid = save_result(name, tier, payload)
-                record_stage(name, "done", result_ref=str(rid))
-                results.append({"scan": name, "result_id": rid})
-                audit(tier, "scan_completed",
-                      {"scan": name, "result_id": rid})
-            except Exception as exc:  # one scan's failure never blocks others
-                audit(tier, "scan_failed",
-                      {"scan": name, "error": str(exc)[:500]})
-                results.append({"scan": name, "error": str(exc)[:200]})
-        return {"leader": True, "tier": tier, "ran": results}
-    finally:
-        conn.close()  # releasing the advisory lock with the connection
+        temporal_client = await Client.connect(TEMPORAL_ADDRESS)
+
+        print(
+            f"CONNECTED TO TEMPORAL: {TEMPORAL_ADDRESS}",
+            flush=True,
+        )
+
+    except Exception as exc:
+        temporal_client = None
+
+        print(
+            f"CRITICAL: Failed to connect to Temporal Server "
+            f"at {TEMPORAL_ADDRESS}: {exc}",
+            flush=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Temporal execution
+# ---------------------------------------------------------------------------
+
+async def _start_temporal_scan(scan_name: str) -> dict:
+    """Start one ScanWorkflow through the shared Temporal client."""
+
+    if temporal_client is None:
+        raise RuntimeError(
+            "Temporal client has not been initialized."
+        )
+
+    config = _load_scan_config(scan_name)
+
+    # Use microseconds to substantially reduce workflow-ID collisions.
+    run_id = datetime.now(ZoneInfo("America/Chicago")).strftime(
+        "%Y%m%d-%H%M%S-%f"
+    )
+
+    workflow_id = (
+        f"scan-{scan_name}-{TIER_NAME}-{run_id}"
+    )
+
+    handle = await temporal_client.start_workflow(
+        "ScanWorkflow",
+        {
+            "scan_config": config,
+        },
+        id=workflow_id,
+        task_queue="equity-scans",
+    )
+
+    result = await handle.result()
+
+    return result
+
+
+def _run_temporal_scan_from_sync(scan_name: str) -> dict:
+    """
+    Synchronous adapter used by failover.run_due_scans().
+
+    failover.py is intentionally synchronous. This function safely submits
+    the async Temporal operation back to FastAPI's existing event loop.
+    """
+
+    if main_event_loop is None:
+        raise RuntimeError(
+            "FastAPI event loop has not been initialized."
+        )
+
+    if temporal_client is None:
+        raise RuntimeError(
+            "Temporal client is not connected."
+        )
+
+    future = asyncio.run_coroutine_threadsafe(
+        _start_temporal_scan(scan_name),
+        main_event_loop,
+    )
+
+    return future.result()
+
+
+# ---------------------------------------------------------------------------
+# Health endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "tier": TIER_NAME,
+        "temporal_connected": temporal_client is not None,
+        "ts": datetime.now(
+            ZoneInfo("America/Chicago")
+        ).isoformat(),
+    }
+
+
+@app.get("/ready")
+def ready():
+    # Database readiness
+    try:
+        with failover.get_conn() as conn:
+            conn.execute("SELECT 1")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Database unreachable: {exc}",
+        )
+
+    # Temporal readiness
+    if temporal_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Temporal client is not connected",
+        )
+
+    return {
+        "status": "ready",
+        "tier": TIER_NAME,
+        "temporal": "connected",
+        "database": "connected",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Watermark endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/internal/watermark/{scan_name}")
+def watermark(
+    scan_name: str,
+    x_watchdog_secret: str | None = Header(default=None),
+):
+    _check_secret(x_watchdog_secret)
+
+    wm = failover.get_watermark(scan_name)
+
+    if wm is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No watermark generated yet",
+        )
+
+    return wm
+
+
+# ---------------------------------------------------------------------------
+# Due-scan execution
+# ---------------------------------------------------------------------------
+
+def _run_due_scans_bg(body: TriggerBody) -> None:
+    """
+    Execute failover's synchronous scheduling/leadership layer in a worker
+    thread while safely bridging Temporal back to FastAPI's event loop.
+    """
+
+    print(
+        f"BACKGROUND WORKER DISPATCHED: {body.run_id}",
+        flush=True,
+    )
+
+    try:
+        summary = failover.run_due_scans(
+            tier=TIER_NAME,
+            runner=_run_temporal_scan_from_sync,
+        )
+
+        failover.audit(
+            TIER_NAME,
+            "watchdog_trigger",
+            {
+                "by": body.triggered_by,
+                "run_id": body.run_id,
+                "summary": summary,
+            },
+        )
+
+        print(
+            f"BACKGROUND WORKER COMPLETED: {body.run_id}",
+            flush=True,
+        )
+
+    except Exception as exc:
+
+        print(
+            f"BACKGROUND WORKER FAILED: {body.run_id}: {exc}",
+            flush=True,
+        )
+
+        failover.audit(
+            TIER_NAME,
+            "watchdog_trigger_failed",
+            {
+                "by": body.triggered_by,
+                "run_id": body.run_id,
+                "error": str(exc)[:500],
+            },
+        )
+
+
+@app.post("/internal/run-due-scans")
+def run_due_scans(
+    body: TriggerBody,
+    background_tasks: BackgroundTasks,
+    x_watchdog_secret: str | None = Header(default=None),
+):
+    _check_secret(x_watchdog_secret)
+
+    if not failover.DATABASE_URL:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "DATABASE_URL not set — refusing execution "
+                "without transactional safety keys."
+            ),
+        )
+
+    if temporal_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Temporal client is not connected",
+        )
+
+    background_tasks.add_task(
+        _run_due_scans_bg,
+        body,
+    )
+
+    return {
+        "accepted": True,
+        "tier": TIER_NAME,
+        "triggered_by": body.triggered_by,
+        "run_id": body.run_id,
+    }
