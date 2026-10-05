@@ -25,12 +25,11 @@ from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from temporalio.client import Client
 
-# --- Mock imports / placeholders assumed from your environment ---
-# import failover
-# TIER_NAME = "prod-scan-tier"
-# WATCHDOG_SECRET = os.environ.get("WATCHDOG_SECRET")
-# TEMPORAL_ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
-# -----------------------------------------------------------------
+import failover
+
+TIER_NAME = os.environ.get("TIER_NAME", "local")
+WATCHDOG_SECRET = os.environ.get("WATCHDOG_SECRET", "")
+TEMPORAL_ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
 
 SCHEDULE_TO_SCAN = {
     "premarket-7am": "Micro Cap Momentum",
