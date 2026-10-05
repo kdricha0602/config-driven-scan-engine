@@ -38,7 +38,7 @@ concurrency:
 jobs:
   probe-and-trigger:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - name: Probe tiers in order, trigger due scans
         id: probe
@@ -53,8 +53,23 @@ jobs:
           for TIER in "$TIER1_URL" "$TIER2_URL" "$TIER3_URL"; do
             [ -z "$TIER" ] && continue
             # /ready checks the tier AND its database connectivity.
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$TIER/ready" || echo "000")
-            echo "probe $TIER -> $CODE"
+            # Retry up to 3x with waits: Render free-tier cold starts can take
+            # 30-60s, and a single 20s probe would false-negative on a waking tier.
+            CODE="000"
+            for ATTEMPT in 1 2 3; do
+              RAW=$(curl -s -o /dev/null -w "%{http_code}" --max-time 45 "$TIER/ready" 2>/dev/null)
+              # curl -w already emits "000" on connection failure; normalize to
+              # exactly 3 chars (guards against empty output on malformed URLs).
+              CODE=$(printf "%.3s" "${RAW:-000}")
+              echo "probe $TIER attempt $ATTEMPT -> $CODE"
+              if [ "$CODE" = "200" ]; then
+                break
+              fi
+              if [ "$ATTEMPT" -lt 3 ]; then
+                echo "tier not ready, waiting 25s (possible cold start)..."
+                sleep 25
+              fi
+            done
             if [ "$CODE" = "200" ]; then
               WINNER="$TIER"
               break
