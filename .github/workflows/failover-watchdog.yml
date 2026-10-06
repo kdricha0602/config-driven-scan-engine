@@ -57,7 +57,7 @@ jobs:
             # 30-60s, and a single 20s probe would false-negative on a waking tier.
             CODE="000"
             for ATTEMPT in 1 2 3; do
-              RAW=$(curl -s -o /dev/null -w "%{http_code}" --max-time 45 "$TIER/ready" 2>/dev/null)
+              RAW=$(curl -s -o /dev/null -w "%{http_code}" --max-time 45 "$TIER/ready" 2>/dev/null || true)
               # curl -w already emits "000" on connection failure; normalize to
               # exactly 3 chars (guards against empty output on malformed URLs).
               CODE=$(printf "%.3s" "${RAW:-000}")
@@ -85,7 +85,7 @@ jobs:
           RESP=$(curl -s --max-time 120 -w "\n%{http_code}" -X POST "$WINNER/internal/run-due-scans" \
             -H "Content-Type: application/json" \
             -H "X-Watchdog-Secret: $WATCHDOG_SECRET" \
-            -d "{\"triggered_by\": \"github-watchdog\", \"run_id\": \"${{ github.run_id }}\"}")
+            -d "{\"triggered_by\": \"github-watchdog\", \"run_id\": \"${{ github.run_id }}\"}") || true
           BODY=$(echo "$RESP" | sed '$d')
           CODE=$(echo "$RESP" | tail -n1)
           echo "trigger -> $CODE $BODY"
@@ -106,6 +106,6 @@ jobs:
                  \"detail\": {\"run_id\": \"${{ github.run_id }}\", \
                               \"tiers\": [\"${{ secrets.TIER1_URL }}\", \
                                           \"${{ secrets.TIER2_URL }}\", \
-                                          \"${{ secrets.TIER3_URL }}\"]}}"
+                                          \"${{ secrets.TIER3_URL }}\"]}}" || true
           echo "outage recorded; all three tiers unreachable"
           exit 1
