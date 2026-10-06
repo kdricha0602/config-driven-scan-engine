@@ -145,6 +145,9 @@ def ready():
         with failover.get_conn() as conn:
             conn.execute("SELECT 1")
     except Exception as exc:
+        # Log the real error to stdout so it appears in Render logs;
+        # the access log only shows the 503, never the cause.
+        print(f"READY_CHECK_FAILED: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}")
     return {"status": "ready", "tier": TIER_NAME}
 
